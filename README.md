@@ -41,20 +41,4 @@ Controls:
 
 Both agents update entirely on the fly—no pretraining, no datasets.
 
-## Customization
-
-Most of the knobs live at the top of `main.py`:
-
-- `FPS`, `PADDLE_SPEED`, `BALL_SPEED`
-- Reward magnitudes (`REWARD_*`)
-- PyTorch optimizers, learning rates, ε schedules
-
-The code is <400 lines, so it’s an easy playground if you want to bolt on replay buffers, curriculum resets, or different heads.
-
-## Troubleshooting
-
-- If the Pygame window fails to open on Windows, ensure you’re running from a local shell (not remote headless) and that GPU drivers are up to date.
-- When running inside WSL/SSH without an X server, set `SDL_VIDEODRIVER=dummy` to disable rendering (you’ll still get console logs).
-
-Enjoy watching the agents learn! Opening an issue/PR is welcome if you add new training modes or experiments.
 
