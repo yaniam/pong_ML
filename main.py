@@ -6,16 +6,17 @@ import numpy as np
 import pygame
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 # --- Game constants ---------------------------------------------------------
-
+GAME_SPEED = 2
 WIDTH, HEIGHT = 960, 540
 PADDLE_WIDTH, PADDLE_HEIGHT = 12, 88
 BALL_SIZE = 14
-PADDLE_SPEED = 6
-BALL_SPEED = 6
-FPS = 60
+PADDLE_SPEED = 6*GAME_SPEED
+BALL_SPEED = 6*GAME_SPEED
+FPS = 120
 
 ACTIONS = (-1, 0, 1)  # up, stay, down
 
@@ -26,12 +27,12 @@ COLOR_RIGHT = (255, 102, 134)
 COLOR_BALL = (253, 255, 150)
 
 # Reward shaping for the right (RL) paddle
-REWARD_HIT = 0.35
+REWARD_HIT = 1.0
 REWARD_RIVAL_HIT = -0.10
-REWARD_SCORE = 1.0
+REWARD_SCORE = 0.3
 REWARD_CONCEDE = -1.0
 
-TEACHER_TOLERANCE = 10
+MISS_FACTOR = 1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_num_threads(1)
@@ -74,7 +75,7 @@ class Ball:
         self.x = WIDTH / 2 - BALL_SIZE / 2
         self.y = HEIGHT / 2 - BALL_SIZE / 2
         dir_x = random.choice([-1, 1]) if direction is None else int(math.copysign(1, direction))
-        angle = random.uniform(-0.4, 0.4)
+        angle = random.uniform(-0.6, 0.6)
         speed = BALL_SPEED
         self.vx = dir_x * speed * math.cos(angle)
         self.vy = speed * math.sin(angle)
@@ -117,24 +118,28 @@ def handle_paddle_collision(ball: Ball, paddle: Paddle, is_left: bool) -> bool:
 
 
 class MLPPaddleAgent:
-    def __init__(self, input_dim: int, hidden_sizes: Tuple[int, int] = (32, 32),
-                 lr: float = 1e-3, epsilon: float = 0.02):
+    def __init__(self, input_dim: int, hidden_sizes: Tuple[int, int] = (64, 64),
+                 lr: float = 1e-3, epsilon: float = 0.1, gamma: float = 0.99):
         h1, h2 = hidden_sizes
         self.net = nn.Sequential(
             nn.Linear(input_dim, h1),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(h1, h2),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(h2, len(ACTIONS)),
         ).to(DEVICE)
         self.optimizer = optim.Adam(self.net.parameters(), lr=lr)
-        self.criterion = nn.CrossEntropyLoss()
         self.epsilon = epsilon
+        self.gamma = gamma
         self.loss_ema: Optional[float] = None
+        self._pending_experiences: list[Tuple[np.ndarray, int]] = []
 
     @staticmethod
     def _tensorize(features: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(features, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+
+    def remember(self, features: np.ndarray, action_idx: int) -> None:
+        self._pending_experiences.append((features.copy(), action_idx))
 
     def select_action(self, features: np.ndarray) -> int:
         if random.random() < self.epsilon:
@@ -145,12 +150,21 @@ class MLPPaddleAgent:
             logits = self.net(x)
         return int(torch.argmax(logits, dim=1).item())
 
-    def update(self, features: np.ndarray, target_idx: int) -> float:
+    def apply_reward(self, reward: float) -> Optional[float]:
+        if not self._pending_experiences:
+            return None
         self.net.train()
-        x = self._tensorize(features)
-        target = torch.tensor([target_idx], dtype=torch.long, device=DEVICE)
-        logits = self.net(x)
-        loss = self.criterion(logits, target)
+        discount = 1.0
+        loss_terms = []
+        for features, action_idx in reversed(self._pending_experiences):
+            x = self._tensorize(features)
+            logits = self.net(x)
+            log_probs = F.log_softmax(logits, dim=1)
+            selected_log_prob = log_probs[0, action_idx]
+            loss_terms.append(-reward * discount * selected_log_prob)
+            discount *= self.gamma
+
+        loss = torch.stack(loss_terms).sum()
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -158,12 +172,16 @@ class MLPPaddleAgent:
         if self.loss_ema is None:
             self.loss_ema = loss_value
         else:
-            self.loss_ema = 0.98 * self.loss_ema + 0.02 * loss_value
+            self.loss_ema = 0.9 * self.loss_ema + 0.1 * loss_value
+        self._pending_experiences.clear()
         return loss_value
+
+    def reset_memory(self) -> None:
+        self._pending_experiences.clear()
 
 
 class RLPaddleAgent:
-    def __init__(self, input_dim: int = 6, hidden_size: int = 64, lr: float = 1e-3,
+    def __init__(self, input_dim: int = 7, hidden_size: int = 64, lr: float = 1e-3,
                  gamma: float = 0.95, epsilon: float = 0.3,
                  epsilon_min: float = 0.05, epsilon_decay: float = 0.999):
         self.q_net = nn.Sequential(
@@ -220,42 +238,29 @@ class RLPaddleAgent:
         else:
             self.loss_ema = 0.98 * self.loss_ema + 0.02 * loss_value
         self.reward_ema = 0.97 * self.reward_ema + 0.03 * reward
-        decay = 0.5 if done else self.epsilon_decay
-        self.epsilon = max(self.epsilon_min, self.epsilon * decay)
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
 
-def build_left_features(left: Paddle, right: Paddle, ball: Ball) -> np.ndarray:
+def build_features(paddle: Paddle, opponent: Paddle, ball: Ball) -> np.ndarray:
     dx, dy = ball.dir_components
+    relative_y = ((ball.y + BALL_SIZE / 2) - paddle.center_y) / HEIGHT
     return np.array([
-        left.y / (HEIGHT - PADDLE_HEIGHT),
+        paddle.y / (HEIGHT - PADDLE_HEIGHT),
+        opponent.y / (HEIGHT - PADDLE_HEIGHT),
         ball.x / WIDTH,
         ball.y / HEIGHT,
-        right.y / (HEIGHT - PADDLE_HEIGHT),
         dx,
         dy,
+        relative_y,
     ], dtype=np.float32)
 
 
-def build_right_features(right: Paddle, left: Paddle, ball: Ball) -> np.ndarray:
-    dx, dy = ball.dir_components
-    return np.array([
-        right.y / (HEIGHT - PADDLE_HEIGHT),
-        ball.x / WIDTH,
-        ball.y / HEIGHT,
-        left.y / (HEIGHT - PADDLE_HEIGHT),
-        dx,
-        dy,
-    ], dtype=np.float32)
 
 
-def teacher_action(ball: Ball, paddle: Paddle, tolerance: float = TEACHER_TOLERANCE) -> int:
-    ball_center = ball.y + BALL_SIZE / 2
-    paddle_center = paddle.center_y
-    if ball_center < paddle_center - tolerance:
-        return 0  # move up
-    if ball_center > paddle_center + tolerance:
-        return 2  # move down
-    return 1  # stay
+# def compute_miss_error(paddle: Paddle, ball: Ball) -> float:
+#     ball_center = ball.y + BALL_SIZE / 2
+#     diff = abs(ball_center - paddle.center_y)
+#     return clamp(diff / HEIGHT, 0.0, 1.0)
 
 
 def draw_center_line(surface: pygame.Surface) -> None:
@@ -277,12 +282,14 @@ def main() -> None:
     left_paddle = Paddle(40, COLOR_LEFT)
     right_paddle = Paddle(WIDTH - 40 - PADDLE_WIDTH, COLOR_RIGHT)
     ball = Ball()
-    mlp_agent = MLPPaddleAgent(input_dim=6)
-    rl_agent = RLPaddleAgent()
+    mlp_agent = MLPPaddleAgent(input_dim=7)
+    rl_agent = RLPaddleAgent(input_dim=7)
+    mlp_loss = 0.0
 
     score_left = 0
     score_right = 0
     running = True
+    ball_touched = False
 
     while running:
         clock.tick(FPS)
@@ -298,43 +305,67 @@ def main() -> None:
                     ball.reset()
                     left_paddle.reset()
                     right_paddle.reset()
+                    mlp_agent.reset_memory()
+                    ball_touched = False
 
-        left_features = build_left_features(left_paddle, right_paddle, ball)
-        target_idx = teacher_action(ball, left_paddle)
+        left_features = build_features(left_paddle, right_paddle, ball)
         left_action_idx = mlp_agent.select_action(left_features)
         left_paddle.move(ACTIONS[left_action_idx] * PADDLE_SPEED)
+        mlp_agent.remember(left_features, left_action_idx)
 
-        right_features = build_right_features(right_paddle, left_paddle, ball)
+        right_features = build_features(right_paddle, left_paddle, ball)
         right_action_idx = rl_agent.select_action(right_features)
         right_paddle.move(ACTIONS[right_action_idx] * PADDLE_SPEED)
 
         ball.update()
 
         reward_right = 0.0
-        if handle_paddle_collision(ball, left_paddle, True):
+        left_collision = handle_paddle_collision(ball, left_paddle, True)
+        if left_collision:
+            ball_touched = True
             reward_right += REWARD_RIVAL_HIT
-        if handle_paddle_collision(ball, right_paddle, False):
+            mlp_loss = mlp_agent.apply_reward(1.0)
+
+        right_collision = handle_paddle_collision(ball, right_paddle, False)
+        if right_collision:
+            ball_touched = True
             reward_right += REWARD_HIT
 
+        allow_training = ball_touched
         point_scored = False
+        left_reward: Optional[float] = None
         if ball.x + BALL_SIZE < 0:
             score_right += 1
             reward_right += REWARD_SCORE
+            #miss_left = MISS_FACTOR * compute_miss_error(left_paddle, ball)
+            miss_left = MISS_FACTOR
+            left_reward = -miss_left
             ball.reset(direction=1)
             left_paddle.reset()
             right_paddle.reset()
             point_scored = True
+            ball_touched = False
         elif ball.x > WIDTH:
             score_left += 1
             reward_right += REWARD_CONCEDE
+            #miss_right = compute_miss_error(right_paddle, ball)
+            miss_right = MISS_FACTOR
+            reward_right -= miss_right
             ball.reset(direction=-1)
             left_paddle.reset()
             right_paddle.reset()
             point_scored = True
+            left_reward = 1.0
+            ball_touched = False
 
-        next_right_features = build_right_features(right_paddle, left_paddle, ball)
-        rl_agent.update(right_features, right_action_idx, reward_right, next_right_features, point_scored)
-        mlp_agent.update(left_features, target_idx)
+        alignment_error = abs((ball.y + BALL_SIZE / 2) - right_paddle.center_y) / (HEIGHT / 2)
+        reward_right -= 0.01 * alignment_error
+
+        next_right_features = build_features(right_paddle, left_paddle, ball)
+        if not point_scored or allow_training:
+            rl_agent.update(right_features, right_action_idx, reward_right, next_right_features, point_scored)
+        if left_reward is not None and (not point_scored or allow_training):
+            mlp_loss = mlp_agent.apply_reward(left_reward)
 
         screen.fill(COLOR_BG)
         draw_center_line(screen)
@@ -345,7 +376,8 @@ def main() -> None:
         score_surface = font_big.render(f"{score_left} : {score_right}", True, COLOR_LINES)
         screen.blit(score_surface, (WIDTH // 2 - score_surface.get_width() // 2, 16))
 
-        mlp_loss = mlp_agent.loss_ema if mlp_agent.loss_ema is not None else 0.0
+        #mlp_loss = mlp_agent.loss_ema if mlp_agent.loss_ema is not None else 0.0
+        mlp_loss = mlp_loss if mlp_loss is not None else 0.0
         rl_loss = rl_agent.loss_ema if rl_agent.loss_ema is not None else 0.0
         hud_lines = [
             f"Left (MLP) loss EMA: {mlp_loss:.3f}",
